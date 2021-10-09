@@ -1,0 +1,179 @@
+- hosts: prod_admin_corp
+  vars:
+    user: ubuntu
+    home: "/home/ubuntu"
+    app_name: "admin-corp"
+    app_branch: "master"
+    app_env: "production"
+    local_root: "/home/ubuntu"
+    db_password: "root"
+    web_root: "/var/www"
+    app_root: "{{web_root}}/{{app_name}}"
+    repo: "admin"
+    local_env_path: "{{local_root}}/ansible/env"
+    repo_url: "https://github.com/chis0m/prod-admin-corp.git"
+    nginx_file: "prod.admin.corp.com"
+    local_nginx_path: "{{local_root}}/ansible/nginx"
+    local_worker_path: "{{local_root}}/ansible/supervisor"
+    worker_file: "laravel-worker"
+  tasks:
+    - name: Go to home directory
+      command: chdir="{{home}}" ls
+
+    - name: Ansible check if repo exists.
+      stat:
+        path: "{{home}}/{{app_name}}"
+      register: repository
+
+    - name: Delete if {{repo}} repo exists
+      file:
+        path: "{{home}}/{{app_name}}"
+        state: absent
+      become_user: "{{user}}"
+      become: yes
+      when: repository.stat.exists
+
+    - debug:
+        msg: "{{app_env}} {{app_name}} repo exists..."
+      when: repository.stat.exists
+    - debug:
+        msg: "{{app_env}} {{app_name}} repo not found"
+      when: repository.stat.exists == False
+
+    - name: pull the {{app_name}} {{app_branch}} branch from github
+      shell: |
+          cd {{home}}
+          git clone --single-branch --branch {{app_branch}} {{repo_url}} {{app_name}}
+          git clone --single-branch --branch master {{repo_url}} prod-admin-corp.com
+      become_user: "{{user}}"
+      become: yes
+
+
+
+    - name: Ansible check if {{app_root}} file exists.
+      stat:
+        path: "{{app_root}}"
+      register: approot
+
+    - name: Delete if {{app_root}} exists
+      file:
+        path: "{{app_root}}"
+        state: absent
+      become_user: root
+      become: yes
+      when: approot.stat.exists
+
+    - name: Copy "{{app_name}}" repo to "{{web_root}}"
+      shell:
+        cmd: cp -r "{{home}}/{{app_name}}" "{{app_root}}"
+      become_user: root
+      become: yes
+
+    - name: copy production .env from local to "{{app_env}}" server
+      copy:
+        src: "{{local_env_path}}/.env"
+        dest: "{{app_root}}"
+      become_user: root
+      become: yes
+
+    - name: update "{{app_root}}" permission
+      shell: |
+        cd {{app_root}}
+        chown -R ubuntu:www-data .
+        composer install --no-interaction --ignore-platform-reqs --no-dev
+        chown -R ubuntu:www-data .
+        find . -type f -exec chmod 664 {} \; &&  find . -type d -exec chmod 775 {} \;
+        chgrp -R www-data storage bootstrap/cache && chmod -R ug+rwx storage bootstrap/cache
+      args:
+        executable: /bin/bash
+      become_user: root
+      become: yes
+
+    - name: Run PHP artisan commands
+      shell: |
+        cd {{app_root}}
+        php artisan migrate:fresh --seed --force
+        php artisan passport:install
+        php artisan cache:clear
+        php artisan config:cache
+      args:
+        executable: /bin/bash
+      become_user: "{{user}}"
+      become: yes
+
+
+    - name: Ansible "{{app_name}}" nginx file exists
+      stat:
+        path: /etc/letsencrypt/live/{{nginx_file}}
+      register: nginx_conf_file
+      become_user: root
+      become: yes
+
+
+    - name: Ansible www "{{app_root}}" https file exists
+      stat:
+        path: "/etc/letsencrypt/live/www.{{nginx_file}}"
+      register: www_nginx_conf
+      become_user: root
+      become: yes
+
+    - debug:
+        msg: "letsencrypt https does not exist"
+      when: 
+        - nginx_conf_file.stat.exists == False
+        - www_nginx_conf.stat.exists == False
+
+
+    - name: copy the nginx config file
+      copy:
+        src: "{{local_nginx_path}}/{{nginx_file}}"
+        dest: "/etc/nginx/sites-available/{{nginx_file}}"
+      when: 
+        - nginx_conf_file.stat.exists == False
+        - www_nginx_conf.stat.exists == False
+      become_user: root
+      become: yes
+
+    - name: create symlink
+      file:
+        src: "/etc/nginx/sites-available/{{nginx_file}}"
+        dest: "/etc/nginx/sites-enabled/{{nginx_file}}"
+        state: link
+      become_user: root
+      become: yes
+      when: 
+        - nginx_conf_file.stat.exists == False
+        - www_nginx_conf.stat.exists == False
+      # notify: Reload Nginx
+
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+      become_user: root
+      become: yes
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+      become_user: root
+      become: yes
+
+
+    - name: copy supervisor laravel-worker file to server
+      copy:
+        src: "{{local_worker_path}}/{{worker_file}}.conf"
+        dest: "/etc/supervisor/conf.d/{{worker_file}}.conf"
+      notify: Reload Supervisord and start worker
+      become_user: root
+      become: yes
+
+  handlers:
+    - name: Reload Supervisord and start worker
+      shell: |
+        supervisorctl reread
+        supervisorctl update
+        supervisorctl stop "{{worker_file}}:*"
+      become_user: root
+      become: yes
